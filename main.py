@@ -4,6 +4,7 @@ import datetime as dt
 import discord
 from discord.ext import commands
 from discord import app_commands
+from discord.errors import NotFound
 
 # ===== 환경 =====
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -19,7 +20,27 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== 공용 =====
+# ===== 안전 응답 헬퍼 =====
+async def safe_reply(inter: discord.Interaction, content=None, embed=None, ephemeral=True):
+    try:
+        if not inter.response.is_done():
+            return await inter.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+        else:
+            return await inter.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+    except NotFound:
+        try:
+            return await inter.followup.send(content=content or "처리가 완료됐어.", embed=embed, ephemeral=ephemeral)
+        except Exception as e:
+            print("safe_reply followup error:", e)
+    except Exception as e:
+        print("safe_reply error:", e)
+        if not inter.response.is_done():
+            try:
+                await inter.response.send_message("처리 중 오류가 발생했어.", ephemeral=True)
+            except:
+                pass
+
+# ===== 공용/DB =====
 def db(): return sqlite3.connect(DB_PATH)
 
 def make_embed(title: str, desc: str = "", fields: list[tuple[str,str,bool]]|None=None):
@@ -40,10 +61,8 @@ def pemoji(s: str|None):
     try: return discord.PartialEmoji.from_str(s.strip())
     except: return None
 
-# ===== DB =====
 def init_db():
     conn=db(); cur=conn.cursor()
-    # 기본 테이블
     cur.execute("""CREATE TABLE IF NOT EXISTS guild_settings(
         guild_id INTEGER PRIMARY KEY,
         category_id INTEGER,
@@ -52,7 +71,10 @@ def init_db():
         channel_name_fmt TEXT DEFAULT 'ticket-{type}-{user}',
         open_msg TEXT DEFAULT '티켓이 열렸습니다.',
         guide_msg TEXT DEFAULT '상담 내용을 구체적으로 남겨주세요. 스태프가 곧 도와드려요.',
-        close_msg TEXT DEFAULT '티켓이 종료되었습니다.'
+        close_msg TEXT DEFAULT '티켓이 종료되었습니다.',
+        modal_title TEXT DEFAULT '티켓 사유 입력',
+        reason_label TEXT DEFAULT '간단한 문의/구매 사유',
+        reason_placeholder TEXT DEFAULT '예) 로벅스 10,000 구매 문의'
     )""")
     cur.execute("""CREATE TABLE IF NOT EXISTS ticket_types(
         guild_id INTEGER,
@@ -75,13 +97,6 @@ def init_db():
         claimed_by INTEGER,
         reason TEXT
     )""")
-    # 모달 커스텀 컬럼(존재하면 무시)
-    try: cur.execute("ALTER TABLE guild_settings ADD COLUMN modal_title TEXT DEFAULT '티켓 사유 입력'")
-    except: pass
-    try: cur.execute("ALTER TABLE guild_settings ADD COLUMN reason_label TEXT DEFAULT '간단한 문의/구매 사유'")
-    except: pass
-    try: cur.execute("ALTER TABLE guild_settings ADD COLUMN reason_placeholder TEXT DEFAULT '예) 로벅스 10,000 구매 문의'")
-    except: pass
     conn.commit(); conn.close()
 
 def get_settings(gid:int):
@@ -181,8 +196,7 @@ class ReasonModal(discord.ui.Modal):
             await self.parent_callback(interaction, str(self.reason).strip())
         except Exception as e:
             print("ReasonModal error:", e); print(traceback.format_exc())
-            if not interaction.response.is_done():
-                await interaction.response.send_message("처리 중 오류가 발생했어. 잠시 후 다시 시도해줘.", ephemeral=True)
+            await safe_reply(interaction, "처리 중 오류가 발생했어.", ephemeral=True)
 
 # ===== 버튼 뷰 =====
 class TicketOpsView(discord.ui.View):
@@ -196,47 +210,46 @@ async def handle_claim(inter: discord.Interaction):
     try:
         ch=inter.channel
         if not isinstance(ch, discord.TextChannel):
-            return await inter.response.send_message("텍스트 채널에서만 가능해.", ephemeral=True)
+            return await safe_reply(inter, "텍스트 채널에서만 가능해.", ephemeral=True)
         row=ticket_from_channel(ch.id)
-        if not row: return await inter.response.send_message("티켓 정보가 없네. 관리자에게 문의!", ephemeral=True)
+        if not row: return await safe_reply(inter, "티켓 정보가 없네. 관리자에게 문의!", ephemeral=True)
         _, gid, _, _, _, _, _, status, claimed_by, _ = row
-        if status!="open": return await inter.response.send_message("닫힌 티켓은 담당 불가.", ephemeral=True)
+        if status!="open": return await safe_reply(inter, "닫힌 티켓은 담당 불가.", ephemeral=True)
         _, support_role_id, *_ = get_settings(gid)
         role_ok=False
         if support_role_id:
             role=inter.guild.get_role(int(support_role_id))
             if role and role in getattr(inter.user,"roles",[]): role_ok=True
-        if not role_ok: return await inter.response.send_message("스태프만 담당 가능.", ephemeral=True)
+        if not role_ok: return await safe_reply(inter, "스태프만 담당 가능.", ephemeral=True)
         if claimed_by and claimed_by!=inter.user.id:
-            return await inter.response.send_message("이미 다른 스태프가 담당 중.", ephemeral=True)
+            return await safe_reply(inter, "이미 다른 스태프가 담당 중.", ephemeral=True)
         conn=db(); cur=conn.cursor()
         cur.execute("UPDATE tickets SET claimed_by=?, last_activity_at=? WHERE channel_id=?",
                     (inter.user.id, now_utc().isoformat(), ch.id))
         conn.commit(); conn.close()
-        await inter.response.send_message(embed=make_embed("담당자 지정", f"{inter.user.mention} 님이 담당합니다."), ephemeral=False)
+        await safe_reply(inter, embed=make_embed("담당자 지정", f"{inter.user.mention} 님이 담당합니다."), ephemeral=False)
     except Exception as e:
         print("handle_claim:", e); print(traceback.format_exc())
-        if not inter.response.is_done(): await inter.response.send_message("처리 중 오류가 발생했어.", ephemeral=True)
+        await safe_reply(inter, "처리 중 오류가 발생했어.", ephemeral=True)
 
 async def handle_close(inter: discord.Interaction):
     try:
         ch=inter.channel
         if not isinstance(ch, discord.TextChannel):
-            return await inter.response.send_message("텍스트 채널에서만 가능해.", ephemeral=True)
+            return await safe_reply(inter, "텍스트 채널에서만 가능해.", ephemeral=True)
         row=ticket_from_channel(ch.id)
-        if not row: return await inter.response.send_message("티켓 정보가 없네. 관리자에게 문의!", ephemeral=True)
+        if not row: return await safe_reply(inter, "티켓 정보가 없네. 관리자에게 문의!", ephemeral=True)
         ticket_id, gid, _, opener_id, *_ = row
-        _, support_role_id, log_channel_id, name_fmt, open_msg, guide_msg, close_msg, *_ = get_settings(gid)
+        _, support_role_id, log_channel_id, *_ = get_settings(gid)
 
-        # 권한: 개설자 또는 스태프
         is_staff=False
         if support_role_id:
             role=inter.guild.get_role(int(support_role_id))
             if role and role in getattr(inter.user,"roles",[]): is_staff=True
         if inter.user.id!=opener_id and not is_staff:
-            return await inter.response.send_message("개설자 또는 스태프만 닫을 수 있어.", ephemeral=True)
+            return await safe_reply(inter, "개설자 또는 스태프만 닫을 수 있어.", ephemeral=True)
 
-        await inter.response.defer(ephemeral=True)
+        await inter.response.defer(ephemeral=True)  # 무거운 처리 전 예약
 
         # 트랜스크립트
         lines=[]
@@ -258,7 +271,8 @@ async def handle_close(inter: discord.Interaction):
                                                        [("종료자", inter.user.mention, True)]), file=file)
                 except Exception as e: print("log send:", e)
 
-        try: await ch.send(embed=make_embed("티켓 종료", close_msg))
+        try:
+            await ch.send(embed=make_embed("티켓 종료", get_settings(gid)[6]))
         except: pass
 
         close_ticket_record(ch.id)
@@ -266,10 +280,14 @@ async def handle_close(inter: discord.Interaction):
             await ch.edit(name=f"closed-{ch.name}", reason="티켓 닫힘")
             await ch.set_permissions(inter.guild.default_role, view_channel=False, send_messages=False)
         except: pass
-        await ch.delete(reason="티켓 닫기")
+        try:
+            await ch.delete(reason="티켓 닫기")
+        except: pass
+
+        await inter.followup.send("티켓을 종료했어.", ephemeral=True)
     except Exception as e:
         print("handle_close:", e); print(traceback.format_exc())
-        if not inter.response.is_done(): await inter.response.send_message("종료 처리 중 오류.", ephemeral=True)
+        await safe_reply(inter, "종료 처리 중 오류.", ephemeral=True)
 
 # ===== 드롭다운 → 모달 → 채널 생성 =====
 class TicketTypeSelect(discord.ui.Select):
@@ -290,109 +308,118 @@ class TicketTypeSelect(discord.ui.Select):
             guild=inter.guild
             category=guild.get_channel(int(category_id)) if category_id else None
             if not isinstance(category, discord.CategoryChannel):
-                return await inter.response.send_message("카테고리가 설정되지 않았어. /티켓설정 카테고리 먼저!", ephemeral=True)
+                return await safe_reply(inter, "카테고리가 설정되지 않았어. /티켓설정 카테고리 먼저!", ephemeral=True)
 
             v=self.values[0]
             label,desc,_=self.map.get(v, ("기타 문의","",None))
 
             async def after_reason(inter2: discord.Interaction, reason_text: str):
-                safe_user = re.sub(r'[^a-z0-9\-]', '', inter.user.name.lower().replace(' ','-')) or str(inter.user.id)
-                slug_type = slugify(label)
-                temp = name_fmt.replace("{type}", slug_type).replace("{user}", safe_user).replace("{id}","x")
-                ch_name = slugify(temp)[:90]
+                try:
+                    # 3초 넘을 수 있으니 예약
+                    if not inter2.response.is_done():
+                        await inter2.response.defer(ephemeral=True)
 
-                overwrites={
-                    guild.default_role: discord.PermissionOverwrite(view_channel=False),
-                    inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
-                                                            read_message_history=True, attach_files=True),
-                }
-                if support_role_id:
-                    role=guild.get_role(int(support_role_id))
-                    if role:
-                        overwrites[role]=discord.PermissionOverwrite(view_channel=True, send_messages=True,
-                                                                    read_message_history=True, manage_messages=True)
+                    safe_user = re.sub(r'[^a-z0-9\-]', '', inter.user.name.lower().replace(' ','-')) or str(inter.user.id)
+                    slug_type = slugify(label)
+                    temp = name_fmt.replace("{type}", slug_type).replace("{user}", safe_user).replace("{id}","x")
+                    ch_name = slugify(temp)[:90]
 
-                # 같은 유저가 이미 연 티켓 방지(같은 카테고리 내)
-                for ch in category.text_channels:
-                    if ch.topic and ch.topic.startswith(f"opener:{inter.user.id}|"):
-                        return await inter2.response.send_message(f"이미 열린 티켓 있어: {ch.mention}", ephemeral=True)
+                    overwrites={
+                        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                        inter.user: discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                                read_message_history=True, attach_files=True),
+                    }
+                    if support_role_id:
+                        role=guild.get_role(int(support_role_id))
+                        if role:
+                            overwrites[role]=discord.PermissionOverwrite(view_channel=True, send_messages=True,
+                                                                        read_message_history=True, manage_messages=True)
 
-                channel = await guild.create_text_channel(
-                    ch_name, category=category, overwrites=overwrites,
-                    topic=f"opener:{inter.user.id}|type:{v}",
-                    reason=f"티켓 생성: {label}"
-                )
+                    # 같은 유저가 이미 연 티켓 방지(같은 카테고리 내)
+                    for ch in category.text_channels:
+                        if ch.topic and ch.topic.startswith(f"opener:{inter.user.id}|"):
+                            return await inter2.followup.send(f"이미 열린 티켓 있어: {ch.mention}", ephemeral=True)
 
-                # DB 기록
-                conn=db(); cur=conn.cursor()
-                now=now_utc().isoformat()
-                cur.execute("""INSERT INTO tickets(guild_id,channel_id,opener_id,type_value,opened_at,last_activity_at,status,claimed_by,reason)
-                               VALUES(?,?,?,?,?,?,?,?,?)""",
-                            (gid, channel.id, inter.user.id, v, now, now, "open", None, reason_text))
-                conn.commit(); ticket_id=cur.lastrowid; conn.close()
+                    channel = await guild.create_text_channel(
+                        ch_name, category=category, overwrites=overwrites,
+                        topic=f"opener:{inter.user.id}|type:{v}",
+                        reason=f"티켓 생성: {label}"
+                    )
 
-                # {id} 치환
-                if "{id}" in name_fmt:
-                    new_name = name_fmt.replace("{type}",slug_type).replace("{user}",safe_user).replace("{id}",str(ticket_id))
-                    new_name = slugify(new_name)[:90]
-                    try: await channel.edit(name=new_name)
-                    except: pass
+                    # DB 기록
+                    conn=db(); cur=conn.cursor()
+                    now=now_utc().isoformat()
+                    cur.execute("""INSERT INTO tickets(guild_id,channel_id,opener_id,type_value,opened_at,last_activity_at,status,claimed_by,reason)
+                                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                                (gid, channel.id, inter.user.id, v, now, now, "open", None, reason_text))
+                    conn.commit(); ticket_id=cur.lastrowid; conn.close()
 
-                # 안내 임베드
-                fields=[("유형",label,True), ("개설자",inter.user.mention,True)]
-                if reason_text: fields.append(("사유", reason_text, False))
-                fields.append(("안내", guide_msg, False))
-                ping = guild.get_role(int(support_role_id)).mention if support_role_id and guild.get_role(int(support_role_id)) else None
-                await channel.send(content=ping, embed=make_embed(open_msg, desc or "", fields), view=TicketOpsView())
-                await inter2.response.send_message(f"티켓 채널이 생성됐어: {channel.mention}", ephemeral=True)
+                    # {id} 치환
+                    if "{id}" in name_fmt:
+                        new_name = name_fmt.replace("{type}",slug_type).replace("{user}",safe_user).replace("{id}",str(ticket_id))
+                        new_name = slugify(new_name)[:90]
+                        try: await channel.edit(name=new_name)
+                        except: pass
 
+                    # 안내 임베드
+                    fields=[("유형",label,True), ("개설자",inter.user.mention,True)]
+                    if reason_text: fields.append(("사유", reason_text, False))
+                    fields.append(("안내", guide_msg, False))
+                    ping = guild.get_role(int(support_role_id)).mention if support_role_id and guild.get_role(int(support_role_id)) else None
+                    await channel.send(content=ping, embed=make_embed(open_msg, desc or "", fields), view=TicketOpsView())
+
+                    await inter2.followup.send(f"티켓 채널이 생성됐어: {channel.mention}", ephemeral=True)
+                except Exception as e:
+                    print("after_reason error:", e); print(traceback.format_exc())
+                    await safe_reply(inter2, "티켓 생성 중 오류.", ephemeral=True)
+
+            # 모달 오픈(가벼우므로 바로)
             await inter.response.send_modal(ReasonModal(modal_title, reason_label, reason_placeholder, after_reason))
         except Exception as e:
-            print("Select callback:", e); print(traceback.format_traceback())
-            if not inter.response.is_done():
-                await inter.response.send_message("티켓 생성 중 오류.", ephemeral=True)
+            print("Select callback:", e); print(traceback.format_exc())
+            await safe_reply(inter, "티켓 생성 중 오류.", ephemeral=True)
 
 class TicketPanelView(discord.ui.View):
     def __init__(self, rows): super().__init__(timeout=None); self.add_item(TicketTypeSelect(rows))
 
-# ===== 슬래시 그룹(핵심만) =====
+# ===== 슬래시 그룹(핵심) =====
 티켓설정 = app_commands.Group(name="티켓설정", description="티켓 설정(관리자)")
 티켓유형 = app_commands.Group(name="티켓유형", description="티켓 드롭다운 항목(관리자)")
 
 @티켓설정.command(name="카테고리", description="티켓 생성 카테고리 설정")
 async def set_cat(inter: discord.Interaction, 카테고리: discord.CategoryChannel):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     upsert_settings(inter.guild_id, category_id=카테고리.id)
-    await inter.response.send_message(embed=make_embed("카테고리 설정 완료", f"{카테고리.mention}"), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("카테고리 설정 완료", f"{카테고리.mention}"), ephemeral=True)
 
 @티켓설정.command(name="역할", description="스태프 역할 설정")
 async def set_role(inter: discord.Interaction, 역할: discord.Role):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     upsert_settings(inter.guild_id, support_role_id=역할.id)
-    await inter.response.send_message(embed=make_embed("스태프 역할 설정 완료", f"{역할.mention}"), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("스태프 역할 설정 완료", f"{역할.mention}"), ephemeral=True)
 
 @티켓설정.command(name="로그채널", description="로그/트랜스크립트 채널 설정(선택)")
 async def set_log(inter: discord.Interaction, 채널: discord.TextChannel):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     upsert_settings(inter.guild_id, log_channel_id=채널.id)
-    await inter.response.send_message(embed=make_embed("로그 채널 설정 완료", f"{채널.mention}"), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("로그 채널 설정 완료", f"{채널.mention}"), ephemeral=True)
 
 @티켓설정.command(name="모달", description="모달 문구 설정(제목/라벨/힌트)")
 @app_commands.describe(제목="모달 제목", 라벨="입력창 라벨", 힌트="입력창 플레이스홀더")
 async def set_modal(inter: discord.Interaction, 제목: str = None, 라벨: str = None, 힌트: str = None):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     kwargs={}
     if 제목 is not None: kwargs["modal_title"]=제목[:50]
     if 라벨 is not None: kwargs["reason_label"]=라벨[:50]
     if 힌트 is not None: kwargs["reason_placeholder"]=힌트[:100]
     if not kwargs:
-        return await inter.response.send_message("제목/라벨/힌트 중 하나 이상 입력해줘.", ephemeral=True)
+        return await safe_reply(inter, "제목/라벨/힌트 중 하나 이상 입력해줘.", ephemeral=True)
     upsert_settings(inter.guild_id, **kwargs)
-    await inter.response.send_message(embed=make_embed("모달 문구 설정", "\n".join([
+    await safe_reply(inter, embed=make_embed("모달 문구 설정", "\n".join([
         f"제목: {kwargs.get('modal_title','(변경 없음)')}",
         f"라벨: {kwargs.get('reason_label','(변경 없음)')}",
         f"힌트: {kwargs.get('reason_placeholder','(변경 없음)')}",
@@ -401,7 +428,7 @@ async def set_modal(inter: discord.Interaction, 제목: str = None, 라벨: str 
 @티켓유형.command(name="프리셋", description="로블록스 5종 프리셋 등록")
 async def type_preset(inter: discord.Interaction):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     presets=[
         ("item","로블록스 아이템 구매","아이템 구매 문의","<:emoji_10:1411978370635399288>",1),
         ("robux","로블록스 로벅스 구매","로벅스 구매 문의","<:emoji_11:1411978635480399963>",2),
@@ -410,61 +437,64 @@ async def type_preset(inter: discord.Interaction):
         ("other","기타 문의","기타 문의","<:emoji_14:1411978741504282685>",5),
     ]
     for v,l,d,e,o in presets: add_type(inter.guild_id, v,l,d,e,o)
-    await inter.response.send_message(embed=make_embed("프리셋 등록 완료","5종 항목이 등록됐어."), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("프리셋 등록 완료","5종 항목이 등록됐어."), ephemeral=True)
 
 @티켓유형.command(name="추가", description="유형 추가/수정")
 async def type_add(inter: discord.Interaction, 라벨:str, 설명:str="", 이모지:str="", 값:str="", 순서:int=0):
     if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+        return await safe_reply(inter, "서버 관리 권한이 필요해.", ephemeral=True)
     if not 값: 값=slugify(라벨)
     if not re.fullmatch(r"[a-z0-9-]{1,50}", 값):
-        return await inter.response.send_message("값은 영소문자/숫자/하이픈 1~50자.", ephemeral=True)
+        return await safe_reply(inter, "값은 영소문자/숫자/하이픈 1~50자.", ephemeral=True)
     add_type(inter.guild_id, 값, 라벨[:100], 설명[:100], (이모지 or None), int(순서))
-    await inter.response.send_message(embed=make_embed("유형 저장", f"{라벨} (값: {값})"), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("유형 저장", f"{라벨} (값: {값})"), ephemeral=True)
 
 @티켓유형.command(name="목록", description="유형 목록 보기")
 async def type_list(inter: discord.Interaction):
     rows=list_types(inter.guild_id)
     if not rows:
-        return await inter.response.send_message("등록된 유형이 없어요. /티켓유형 프리셋 또는 /티켓유형 추가 먼저!", ephemeral=True)
+        return await safe_reply(inter, "등록된 유형이 없어요. /티켓유형 프리셋 또는 /티켓유형 추가 먼저!", ephemeral=True)
     desc=""
     for v,label,d,e,o in rows[:25]:
         desc += f"- [{o}] {e+' ' if e else ''}{label} (값: {v}) - {d or ''}\n"
-    await inter.response.send_message(embed=make_embed("유형 목록", desc or "(없음)"), ephemeral=True)
+    await safe_reply(inter, embed=make_embed("유형 목록", desc or "(없음)"), ephemeral=True)
 
 # ---- 패널/운영 ----
 @bot.tree.command(name="티켓패널", description="티켓 패널 게시(관리자)")
 async def ticket_panel(inter: discord.Interaction):
-    if not inter.user.guild_permissions.manage_guild:
-        return await inter.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
-    rows=list_types(inter.guild_id)
-    if not rows:
-        return await inter.response.send_message("유형이 없어요. /티켓유형 프리셋 또는 /티켓유형 추가 먼저!", ephemeral=True)
-    cat,*_=get_settings(inter.guild_id)
-    if not cat:
-        return await inter.response.send_message("카테고리 미설정. /티켓설정 카테고리 먼저!", ephemeral=True)
-    await inter.response.send_message(embed=make_embed("구매 & 문의","아래 드롭다운에서 항목을 선택해줘."),
-                                     view=TicketPanelView(rows))
+    try:
+        await inter.response.defer(ephemeral=True)  # 예약
+        rows=list_types(inter.guild_id)
+        if not rows:
+            return await inter.followup.send("유형이 없어요. /티켓유형 프리셋 또는 /티켓유형 추가 먼저!", ephemeral=True)
+        cat,*_=get_settings(inter.guild_id)
+        if not cat:
+            return await inter.followup.send("카테고리 미설정. /티켓설정 카테고리 먼저!", ephemeral=True)
+        await inter.followup.send(embed=make_embed("구매 & 문의","아래 드롭다운에서 항목을 선택해줘."),
+                                  view=TicketPanelView(rows), ephemeral=True)
+    except Exception as e:
+        print("ticket_panel:", e); print(traceback.format_exc())
+        await safe_reply(inter, "패널 게시 중 오류.", ephemeral=True)
 
-@bot.tree.command(name="티켓", description="티켓 채널 운영(버튼 사용 권장)")
+@bot.tree.command(name="티켓", description="티켓 채널 운영(이름변경/우선순위)")
 @app_commands.describe(액션="이름변경/우선순위", 값="새이름 또는 우선순위(low|normal|high)")
 async def ticket_ops(inter: discord.Interaction, 액션:str, 값:str=""):
     ch=inter.channel
     if not isinstance(ch, discord.TextChannel):
-        return await inter.response.send_message("티켓 채널에서만 써줘.", ephemeral=True)
+        return await safe_reply(inter, "티켓 채널에서만 써줘.", ephemeral=True)
     row=ticket_from_channel(ch.id)
-    if not row: return await inter.response.send_message("티켓 채널이 아니야.", ephemeral=True)
+    if not row: return await safe_reply(inter, "티켓 채널이 아니야.", ephemeral=True)
     if 액션 == "이름변경":
-        if not 값: return await inter.response.send_message("새 이름을 입력해줘.", ephemeral=True)
+        if not 값: return await safe_reply(inter, "새 이름을 입력해줘.", ephemeral=True)
         new_name=slugify(값)[:90]
         try:
             await ch.edit(name=new_name, reason="티켓 이름변경")
-            await inter.response.send_message(embed=make_embed("이름 변경", f"#{new_name}"), ephemeral=False)
-        except: await inter.response.send_message("이름 변경 실패.", ephemeral=True)
+            await safe_reply(inter, embed=make_embed("이름 변경", f"#{new_name}"), ephemeral=False)
+        except: await safe_reply(inter, "이름 변경 실패.", ephemeral=True)
     elif 액션 == "우선순위":
         pr=(값 or "normal").lower()
         if pr not in ("low","normal","high"):
-            return await inter.response.send_message("low/normal/high 중 하나.", ephemeral=True)
+            return await safe_reply(inter, "low/normal/high 중 하나.", ephemeral=True)
         try:
             name=ch.name
             if name.startswith(("low-","normal-","high-")):
@@ -472,12 +502,12 @@ async def ticket_ops(inter: discord.Interaction, 액션:str, 값:str=""):
             else:
                 name = pr + "-" + name
             await ch.edit(name=name, reason="우선순위 변경")
-            await inter.response.send_message(embed=make_embed("우선순위", pr), ephemeral=False)
-        except: await inter.response.send_message("우선순위 변경 실패.", ephemeral=True)
+            await safe_reply(inter, embed=make_embed("우선순위", pr), ephemeral=False)
+        except: await safe_reply(inter, "우선순위 변경 실패.", ephemeral=True)
     else:
-        await inter.response.send_message("액션은 이름변경/우선순위 중 하나.", ephemeral=True)
+        await safe_reply(inter, "액션은 이름변경/우선순위 중 하나.", ephemeral=True)
 
-# ===== 활동 시간 갱신 =====
+# ===== 활동 시간 갱신(필요 최소) =====
 @bot.event
 async def on_message(message: discord.Message):
     try:
@@ -504,34 +534,26 @@ async def on_guild_join(guild: discord.Guild):
 async def on_ready():
     init_db()
 
-    # 그룹 등록(중복 예외 무시)
     for grp in (티켓설정, 티켓유형):
         try: bot.tree.add_command(grp)
         except Exception as e: print(f"[TREE] 그룹 추가 스킵: {getattr(grp,'name','?')} ({e})")
 
-    # 퍼시스턴트 뷰
     try: bot.add_view(TicketOpsView())
     except Exception as e: print("[VIEW] 등록 실패:", e)
 
-    # 로컬 트리 로그
-    local = bot.tree.get_commands()
-    print(f"[TREE] 로컬 명령 수: {len(local)} -> {[c.name for c in local]}")
-
-    # 1) 글로벌 명령 비움(중복 방지)
+    # 글로벌 비우고(중복 방지) → 길드만 싱크
     try:
         bot.tree.clear_commands(guild=None)
-        cleared = await bot.tree.sync()  # 글로벌을 빈 상태로 동기화
-        print(f"[SYNC][GLOBAL-PURGE] 글로벌 비움: {len(cleared)}개")
+        await bot.tree.sync()  # 글로벌을 빈 상태로 동기화(삭제)
     except Exception as e:
         print("[SYNC][GLOBAL-PURGE] 예외:", e)
 
-    # 2) 길드 전용 싱크
     try:
         if GUILD_ID:
             gid=int(GUILD_ID)
             bot.tree.copy_global_to(guild=discord.Object(id=gid))
             synced = await bot.tree.sync(guild=discord.Object(id=gid))
-            print(f"[SYNC][GUILD] 지정 길드({gid}): {len(synced)}개")
+            print(f"[SYNC][GUILD] {gid}: {len(synced)}개")
         else:
             total=0
             for g in bot.guilds:
@@ -539,11 +561,11 @@ async def on_ready():
                 synced = await bot.tree.sync(guild=discord.Object(id=g.id))
                 print(f"[SYNC][GUILD] {g.name}({g.id}): {len(synced)}개")
                 total += len(synced)
-            print(f"[SYNC] 전체 길드 합계: {total}개")
+            print(f"[SYNC] 길드 합계: {total}개")
     except Exception as e:
         print("[SYNC][GUILD] 예외:", e)
 
-    print(f"[READY] 로그인 성공: {bot.user}")
+    print(f"[READY] 로그인: {bot.user}")
 
 if __name__ == "__main__":
     if not TOKEN:
