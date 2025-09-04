@@ -7,7 +7,7 @@ from discord import app_commands
 
 # ========= 환경설정 =========
 TOKEN = os.getenv("DISCORD_TOKEN")
-GUILD_ID = os.getenv("GUILD_ID")  # 선택(빠른 동기화)
+GUILD_ID = os.getenv("GUILD_ID")  # 선택(빠른 동기화), 비우면 모든 길드 개별 동기화
 DB_PATH = "ticketbot.db"
 
 def now_utc() -> dt.datetime:
@@ -387,7 +387,7 @@ class TicketTypeSelect(discord.ui.Select):
                     if role:
                         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
 
-                # 중복 티켓 방지
+                # 중복 티켓 방지(같은 유저 티켓)
                 for ch in category.text_channels:
                     if ch.topic and ch.topic.startswith(f"opener:{interaction.user.id}|"):
                         return await inter.response.send_message(f"이미 열린 티켓 있어: {ch.mention}", ephemeral=True)
@@ -699,7 +699,7 @@ async def ticket_ops(interaction: discord.Interaction, 액션: str, 대상: disc
 
 # ---- 강제 동기화(관리자 전용) ----
 @bot.tree.command(name="강제동기화", description="(관리자) 이 서버에 슬래시 명령을 즉시 동기화합니다")
-async def 강제동기화(interaction: discord.Interaction):
+async def force_sync(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.manage_guild:
         return await interaction.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
     try:
@@ -707,6 +707,21 @@ async def 강제동기화(interaction: discord.Interaction):
         await interaction.response.send_message(f"동기화 완료: {len(synced)}개", ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"동기화 실패: {e}", ephemeral=True)
+
+# ---- 점검(선택) ----
+@bot.tree.command(name="점검", description="현재 서버 명령/설정 점검")
+async def 점검(interaction: discord.Interaction):
+    cmds = await bot.tree.fetch_commands(guild=discord.Object(id=interaction.guild_id))
+    names = ", ".join(sorted(c.name for c in cmds)) or "(없음)"
+    cat, role, log, max_open, cd, ac, fmt, *_ = get_settings(interaction.guild_id)
+    desc = (
+        f"- 등록 명령 수: {len(cmds)}개\n"
+        f"- 명령 목록: {names}\n"
+        f"- 카테고리: {cat}, 스태프 역할: {role}, 로그채널: {log}\n"
+        f"- 동시/쿨다운/자동닫힘: {max_open}개 / {cd}s / {ac}분\n"
+        f"- 채널포맷: {fmt}"
+    )
+    await interaction.response.send_message(desc, ephemeral=True)
 
 # ========= 활동 갱신(자동닫힘 근거) =========
 @bot.event
@@ -719,6 +734,21 @@ async def on_message(message: discord.Message):
                 update_ticket_activity(message.channel.id)
     except Exception as e:
         print("on_message:", e)
+
+# ========= “명령 0개” 길드 재동기화 루프 =========
+@tasks.loop(seconds=30)
+async def resync_until_ok():
+    try:
+        for g in bot.guilds:
+            try:
+                cmds = await bot.tree.fetch_commands(guild=discord.Object(id=g.id))
+                if len(cmds) == 0:
+                    synced = await bot.tree.sync(guild=discord.Object(id=g.id))
+                    print(f"[RESYNC] {g.name}({g.id}) 재동기화: {len(synced)}개")
+            except Exception as e:
+                print(f"[RESYNC] {g.id} 실패: {e}")
+    except Exception as e:
+        print("resync_until_ok loop error:", e)
 
 # ========= 에러 핸들러(친절하게) =========
 @bot.event
@@ -733,19 +763,13 @@ async def on_command_error(ctx: commands.Context, error: Exception):
 @bot.event
 async def on_ready():
     init_db()
+
     # 그룹 등록(중복 등록 예외 무시)
-    try:
-        bot.tree.add_command(티켓설정)
-    except Exception:
-        pass
-    try:
-        bot.tree.add_command(티켓메시지)
-    except Exception:
-        pass
-    try:
-        bot.tree.add_command(티켓유형)
-    except Exception:
-        pass
+    for grp in (티켓설정, 티켓메시지, 티켓유형):
+        try:
+            bot.tree.add_command(grp)
+        except Exception:
+            pass
 
     # 퍼시스턴트 뷰
     try:
@@ -753,15 +777,36 @@ async def on_ready():
     except Exception:
         pass
 
-    # 슬래시 동기화
+    # 현재 봇이 들어가 있는 길드 리스트
+    try:
+        if bot.guilds:
+            print("[GUILDS]", ", ".join(f"{g.name}({g.id})" for g in bot.guilds))
+        else:
+            print("[GUILDS] 봇이 어떤 서버에도 초대되어 있지 않음")
+    except Exception as e:
+        print("guild list print error:", e)
+
+    # per-guild 강제 동기화(즉시 보이도록)
     try:
         if GUILD_ID:
-            await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
+            gid = int(GUILD_ID)
+            synced = await bot.tree.sync(guild=discord.Object(id=gid))
+            print(f"[SYNC] 지정 길드 동기화 완료: {len(synced)}개 (GUILD_ID={gid})")
         else:
-            await bot.tree.sync()
+            total = 0
+            for g in bot.guilds:
+                synced = await bot.tree.sync(guild=discord.Object(id=g.id))
+                print(f"[SYNC] {g.name}({g.id}) 동기화: {len(synced)}개")
+                total += len(synced)
+            print(f"[SYNC] 전체 길드 동기화 합계: {total}개")
     except Exception as e:
         print("슬래시 동기화 오류:", e)
 
+    # 재시도 루프 시작
+    if not resync_until_ok.is_running():
+        resync_until_ok.start()
+
+    # 자동 닫힘 루프
     if not auto_close_loop.is_running():
         auto_close_loop.start()
 
