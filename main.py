@@ -387,7 +387,7 @@ class TicketTypeSelect(discord.ui.Select):
                     if role:
                         overwrites[role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True, manage_messages=True)
 
-                # 중복 티켓 방지(같은 유저가 이 카테고리에서 가진 티켓)
+                # 중복 티켓 방지
                 for ch in category.text_channels:
                     if ch.topic and ch.topic.startswith(f"opener:{interaction.user.id}|"):
                         return await inter.response.send_message(f"이미 열린 티켓 있어: {ch.mention}", ephemeral=True)
@@ -685,7 +685,6 @@ async def ticket_ops(interaction: discord.Interaction, 액션: str, 대상: disc
         if pr not in ("low", "normal", "high"):
             return await interaction.response.send_message("우선순위는 low/normal/high 중 하나.", ephemeral=True)
         try:
-            # 기존 prefix 교체/부착
             name = ch.name
             if name.startswith(("low-", "normal-", "high-")):
                 name = pr + "-" + name.split("-", 1)[1]
@@ -697,6 +696,17 @@ async def ticket_ops(interaction: discord.Interaction, 액션: str, 대상: disc
             await interaction.response.send_message("우선순위 변경 실패.", ephemeral=True)
     else:
         await interaction.response.send_message("액션은 참가자추가/참가자제거/이름변경/우선순위 중 하나.", ephemeral=True)
+
+# ---- 강제 동기화(관리자 전용) ----
+@bot.tree.command(name="강제동기화", description="(관리자) 이 서버에 슬래시 명령을 즉시 동기화합니다")
+async def 강제동기화(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.manage_guild:
+        return await interaction.response.send_message("서버 관리 권한이 필요해.", ephemeral=True)
+    try:
+        synced = await bot.tree.sync(guild=discord.Object(id=interaction.guild_id))
+        await interaction.response.send_message(f"동기화 완료: {len(synced)}개", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"동기화 실패: {e}", ephemeral=True)
 
 # ========= 활동 갱신(자동닫힘 근거) =========
 @bot.event
